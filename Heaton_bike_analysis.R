@@ -14,6 +14,8 @@ bikeTrain <- bikeTrain %>%
 
 ## Cleaning & Feature Engineering
 bike_recipe <- recipe(count~., data=bikeTrain) %>%
+#  step_mutate(count = log(as.numeric(count))) %>%  #Attempted log transformation
+#  step_log() %>% # Another attempted log transformation
   step_mutate(weather=ifelse(weather==4, 3, weather)) %>% #Relabel weather 4 to 3
   step_mutate(weather=factor(weather, levels=1:3, labels=c("Sunny", "Mist", "Rain"))) %>%
   step_mutate(season=factor(season, levels=1:4, labels=c("Spring", "Summer", "Fall", "Winter"))) %>%
@@ -47,6 +49,7 @@ test_preds <- predict(bike_workflow, new_data = bikeTest) %>%
   select(datetime, .pred) %>% #Just keep datetime and predictions
   rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
   mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+#  mutate(count=exp(count)) %>% #attempt to transform back to original scale (0, prediction)
   mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
 
 ## Write prediction file to CSV
@@ -71,6 +74,7 @@ test_pois_preds <- predict(bike_pois_workflow, new_data = bikeTest) %>%
   bind_cols(., bikeTest) %>% #Bind predictions with test data
   select(datetime, .pred) %>% #Just keep datetime and predictions
   rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+#  mutate(count = exp(count)) %>%  # attempt to rescale the count variable
   mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
   mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
 
