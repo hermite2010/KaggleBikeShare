@@ -21,15 +21,20 @@ my_recipe <- recipe(count ~ ., data=bike_train) %>% # Set model formula and d
 prepped_recipe <- prep(my_recipe)
 head(bake(prepped_recipe, new_data=bike_test), n = 15)
 
-# Linear Regression
+# Linear Regression: defining the model
 my_mod <- linear_reg() %>% 
   set_engine("lm")
 
+# Set up the workflow
 bike_workflow <- workflow() %>% 
   add_recipe(my_recipe) %>% 
   add_model(my_mod) %>% 
   fit(data = bike_train)
 
+extract_fit_engine(bike_workflow) %>% 
+  tidy()
+
+# Apply the workflow to the prediction model
 bike_predictions <- predict(bike_workflow,
                             new_data=bike_test)
 
