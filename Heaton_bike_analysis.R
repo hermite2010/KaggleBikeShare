@@ -22,11 +22,38 @@ bike_recipe <- recipe(count~., data=bikeTrain) %>%
   step_mutate(holiday=factor(holiday, levels=c(0,1), labels=c("No", "Yes"))) %>%
   step_mutate(workingday=factor(workingday,levels=c(0,1), labels=c("No", "Yes"))) %>%
   step_time(datetime, features="hour") %>%
-  step_rm(datetime)
+  step_rm(datetime) %>% 
+  step_dummy(all_nominal_predictors()) %>% #make dummy variables FOR PENALIZED
+  step_normalize(all_numeric_predictors()) # Make mean 0, sd=1 FOR PENALIZED
 prepped_recipe <- prep(bike_recipe)
 bake(prepped_recipe, new_data = bikeTrain) #Make sure recipe work on train
 bake(prepped_recipe, new_data = bikeTest) #Make sure recipe works on test
 
+
+# Log Transformation ------------------------------------------------------
+## Transform to log(count) - I can only do this on train set because
+## test set does not have count.  Hence, I am doing this outside of recipe
+## because I only apply this to the train set
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+## Define the model
+lin_model <- linear_reg() %>%
+  set_engine("lm")
+## Set up the whole workflow
+log_lin_workflow <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(lin_model) %>%
+  fit(data=logTrainSet) #Make sure to use the log(count) dataset
+## Get Predictions for test set AND format for Kaggle
+log_lin_preds <- predict(log_lin_workflow, new_data = bikeTest) %>% #This predicts log(count)
+  mutate(.pred=exp(.pred)) %>% # Back-transform the log to original scale
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
+## Write predictions to CSV
+vroom_write(x=log_lin_preds, file="./LogLinearPreds.csv", delim=",")
 
 # Linear Regression -------------------------------------------------------
 ## Define the model
@@ -80,3 +107,84 @@ test_pois_preds <- predict(bike_pois_workflow, new_data = bikeTest) %>%
 
 ## Write prediction file to CSV
 vroom_write(x=test_pois_preds, file="KaggleBikeShare/PoisTestPreds.csv", delim=",")
+
+# Penalized Regression ----------------------------------------------------
+
+# For LOG TRANSFORMATION
+
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+## Penalized regression model
+preg_model <- linear_reg(penalty=0, mixture=0) %>% #Set model and tuning
+  set_engine("glmnet") # Function to fit in R
+
+preg_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(preg_model) %>%
+  fit(data=logTrainSet) # USING THE LOG TRAINING SET
+
+test_penal_preds <- predict(preg_wf, new_data=bikeTest) %>%
+  mutate(.pred=exp(.pred)) %>% # RESETS THE LOG TRANSFORMATION
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime)))
+
+vroom_write(x=test_penal_preds, file="KaggleBikeShare/PenalizedTestPreds.csv", delim=",")
+
+# Cross Validation --------------------------------------------------------
+
+# For LOG TRANSFORMATION
+
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+## Penalized regression model
+preg_model <- linear_reg(penalty=tune(), 
+                         mixture=tune()) %>% #Set model and tuning
+  set_engine("glmnet") # Function to fit in R
+
+preg_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(preg_model)
+
+tuning_grid <- grid_regular(penalty(),
+                            mixture(),
+                            levels = 100)
+
+folds <- vfold_cv(logTrainSet, v = 10, repeats=1)
+
+## Run the CV
+CV_results <- preg_wf %>%
+  tune_grid(resamples=folds,
+            grid=tuning_grid,
+            metrics=metric_set(rmse, mae, rsq)) #Or leave metrics NULL
+
+## Plot Results (example)
+collect_metrics(CV_results) %>% # Gathers metrics into DF
+  filter(.metric=="rmse") %>%
+  ggplot(data=., aes(x=penalty, y=mean, color=factor(mixture))) +
+  geom_line()
+
+## Find Best Tuning Parameters
+bestTune <- CV_results %>%
+select_best("rmse")
+
+## Finalize the Workflow & fit it
+final_wf <- preg_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data=logTrainSet)
+
+## Predict
+test_cv_preds <- predict(final_wf, new_data=bikeTest) %>%
+  mutate(.pred=exp(.pred)) %>% # RESETS THE LOG TRANSFORMATION
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime)))
+
+vroom_write(x=test_cv_preds, file="KaggleBikeShare/CVTestPreds.csv", delim=",")
+
