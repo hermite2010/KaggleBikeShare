@@ -3,6 +3,7 @@ library(tidyverse)
 library(tidymodels)
 library(vroom)
 library(poissonreg)
+library(rpart)
 
 ## Read in the data
 bikeTrain <- vroom("KaggleBikeShare/train.csv")
@@ -187,4 +188,63 @@ test_cv_preds <- predict(final_wf, new_data=bikeTest) %>%
   mutate(datetime=as.character(format(datetime)))
 
 vroom_write(x=test_cv_preds, file="KaggleBikeShare/CVTestPreds.csv", delim=",")
+
+
+# Decision Tree -----------------------------------------------------------
+
+tree_mod <- decision_tree(tree_depth = tune(),
+                          cost_complexity = tune(),
+                          min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+## Workflow and model and recipe
+
+tree_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(tree_mod)
+
+## set up grid of tuning values
+
+tuning_grid <- grid_regular(tree_depth(),
+                            cost_complexity(),
+                            min_n(),
+                            levels = 5)
+
+## set up k-fold CV
+
+folds <- vfold_cv(logTrainSet, v = 5, repeats=1)
+
+## Run the CV
+
+CV_results <- tree_wf %>%
+  tune_grid(resamples=folds,
+            grid=tuning_grid,
+            metrics=metric_set(rmse, mae, rsq)) #Or leave metrics NULL
+
+## find best tuning parameters
+
+bestTune <- CV_results %>%
+  select_best("rmse")
+
+## Finalize workflow and prediction 
+
+final_wf <- tree_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data=logTrainSet)
+
+# Predict and format for Kaggle
+
+test_tree_preds <- predict(final_wf, new_data=bikeTest) %>%
+  mutate(.pred=exp(.pred)) %>% # RESETS THE LOG TRANSFORMATION
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime)))
+
+vroom_write(x=test_tree_preds, file="KaggleBikeShare/TreeTestPreds.csv", delim=",")
 
