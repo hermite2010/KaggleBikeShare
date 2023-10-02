@@ -4,6 +4,8 @@ library(tidymodels)
 library(vroom)
 library(poissonreg)
 library(rpart)
+library(ranger)
+library(stacks)
 
 ## Read in the data
 bikeTrain <- vroom("KaggleBikeShare/train.csv")
@@ -29,7 +31,6 @@ bike_recipe <- recipe(count~., data=bikeTrain) %>%
 prepped_recipe <- prep(bike_recipe)
 bake(prepped_recipe, new_data = bikeTrain) #Make sure recipe work on train
 bake(prepped_recipe, new_data = bikeTest) #Make sure recipe works on test
-
 
 # Log Transformation ------------------------------------------------------
 ## Transform to log(count) - I can only do this on train set because
@@ -62,17 +63,17 @@ lin_model <- linear_reg() %>%
   set_engine("lm")
 
 ## Set up the whole workflow
-bike_workflow <- workflow() %>%
+lin_workflow <- workflow() %>%
   add_recipe(bike_recipe) %>%
   add_model(lin_model) %>%
   fit(data=bikeTrain)
 
 ## Look at the fitted LM model this way
-extract_fit_engine(bike_workflow) %>%
+extract_fit_engine(lin_workflow) %>%
   summary()
 
 ## Get Predictions for test set AND format for Kaggle
-test_preds <- predict(bike_workflow, new_data = bikeTest) %>%
+test_preds <- predict(lin_workflow, new_data = bikeTest) %>%
   bind_cols(., bikeTest) %>% #Bind predictions with test data
   select(datetime, .pred) %>% #Just keep datetime and predictions
   rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
@@ -248,3 +249,139 @@ test_tree_preds <- predict(final_wf, new_data=bikeTest) %>%
 
 vroom_write(x=test_tree_preds, file="KaggleBikeShare/TreeTestPreds.csv", delim=",")
 
+
+# Random Forest -----------------------------------------------------------
+rand_for_mod <- rand_forest(mtry = tune(),
+                      min_n=tune(),
+                      trees=750) %>% #Type of model
+  set_engine("ranger") %>% # What R function to use
+  set_mode("regression")
+
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+## Workflow and model and recipe
+
+rand_for_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(rand_for_mod)
+
+## set up grid of tuning values
+
+rand_tuning_grid <- grid_regular(mtry(range = c(1,(ncol(logTrainSet)))),
+                            min_n(),
+                            levels = 5)
+
+## set up k-fold CV
+
+rand_folds <- vfold_cv(logTrainSet, v = 5, repeats=1)
+
+## Run the CV
+
+CV_results <- rand_for_wf %>%
+  tune_grid(resamples=rand_folds,
+            grid=rand_tuning_grid,
+            metrics=metric_set(rmse, mae, rsq)) #Or leave metrics NULL
+
+## find best tuning parameters
+
+bestTune <- CV_results %>%
+  select_best("rmse")
+
+## Finalize workflow and prediction 
+
+final_wf <- rand_for_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data=logTrainSet)
+
+# Predict and format for Kaggle
+
+test_rand_preds <- predict(final_wf, new_data=bikeTest) %>%
+  mutate(.pred=exp(.pred)) %>% # RESETS THE LOG TRANSFORMATION
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime)))
+
+vroom_write(x=test_rand_preds, file="KaggleBikeShare/RandForestTestPreds.csv", delim=",")
+
+# Stacking Models ---------------------------------------------------------
+
+# Using the log of the data
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+# Splitting the data for Cross Validation
+folds <- vfold_cv(logTrainSet, v = 5, repeats = 1)
+
+# Control Settings for stacking models
+untunedModel <- control_stack_grid()
+tunedModel <- control_stack_resamples()
+
+# Penalized regression model
+preg_model <- linear_reg(penalty=tune(), 
+                         mixture=tune()) %>% #Set model and tuning
+  set_engine("glmnet") # Function to fit in R
+
+preg_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(preg_model)
+
+tuning_grid <- grid_regular(penalty(),
+                            mixture(),
+                            levels = 5)
+
+# RUNNING THE CROSS VALIDATION
+preg_models <- preg_wf %>% 
+  tune_grid(resamples = folds,
+            grid = tuning_grid,
+            metrics = metric_set(rmse, mae, rsq),
+            control = untunedModel) # THIS IS WHERE WE START STACKING
+
+# RANDOM FOREST 
+rand_for_mod <- rand_forest(mtry = tune(),
+                            min_n = tune(),
+                            trees=750) %>% #Type of model
+  set_engine("ranger") %>% # What R function to use
+  set_mode("regression")
+
+## Workflow and model and recipe
+rand_for_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(rand_for_mod)
+
+## set up grid of tuning values
+rand_tuning_grid <- grid_regular(mtry(range = c(1,(ncol(logTrainSet)))),
+                                 min_n(),
+                                 levels = 5)
+
+## Running the Cross validation
+rand_models <- rand_for_wf %>%
+  tune_grid(resamples=folds,
+            grid=rand_tuning_grid,
+            metrics=metric_set(rmse, mae, rsq), #Or leave metrics NULL
+            control = untunedModel)
+
+# Specify with models to include
+my_first_stack <- stacks() %>% 
+  add_candidates(preg_models) %>% 
+  add_candidates(rand_models)
+
+# Fitting the stacked model
+stack_mod <- my_first_stack %>% 
+  blend_predictions() %>% 
+  fit_members()
+
+stackData <- as_tibble(my_first_stack)
+
+stacked_preds <- stack_mod %>% 
+  predict(new_data = bikeTest) %>% 
+  mutate(.pred=exp(.pred)) %>% # RESETS THE LOG TRANSFORMATION
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime)))
+
+vroom_write(x=stacked_preds, file="KaggleBikeShare/StackedPreds.csv", delim=",")
