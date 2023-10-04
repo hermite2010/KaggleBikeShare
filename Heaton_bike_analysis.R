@@ -1,11 +1,14 @@
 ## Libraries I am going to need
 library(tidyverse)
 library(tidymodels)
-library(vroom)
-library(poissonreg)
-library(rpart)
-library(ranger)
-library(stacks)
+library(vroom)      # FOR WRITING CSV
+library(poissonreg) # FOR POISSON REGRESSION
+library(rpart)      # FOR DECISION TREE
+library(ranger)     # FOR RANDOM FOREST
+library(stacks)     # FOR STACKING
+library(xgboost)    # FOR BOOSTED TREES
+library(parsnip)    # FOR BART
+library(dbarts)
 
 ## Read in the data
 bikeTrain <- vroom("KaggleBikeShare/train.csv")
@@ -17,17 +20,16 @@ bikeTrain <- bikeTrain %>%
 
 ## Cleaning & Feature Engineering
 bike_recipe <- recipe(count~., data=bikeTrain) %>%
-#  step_mutate(count = log(as.numeric(count))) %>%  #Attempted log transformation
-#  step_log() %>% # Another attempted log transformation
   step_mutate(weather=ifelse(weather==4, 3, weather)) %>% #Relabel weather 4 to 3
   step_mutate(weather=factor(weather, levels=1:3, labels=c("Sunny", "Mist", "Rain"))) %>%
   step_mutate(season=factor(season, levels=1:4, labels=c("Spring", "Summer", "Fall", "Winter"))) %>%
   step_mutate(holiday=factor(holiday, levels=c(0,1), labels=c("No", "Yes"))) %>%
   step_mutate(workingday=factor(workingday,levels=c(0,1), labels=c("No", "Yes"))) %>%
   step_time(datetime, features="hour") %>%
+  step_date(datetime, features = "year") %>% 
   step_rm(datetime) %>% 
   step_dummy(all_nominal_predictors()) %>% #make dummy variables FOR PENALIZED
-  step_normalize(all_numeric_predictors()) # Make mean 0, sd=1 FOR PENALIZED
+  step_normalize(all_numeric_predictors())
 prepped_recipe <- prep(bike_recipe)
 bake(prepped_recipe, new_data = bikeTrain) #Make sure recipe work on train
 bake(prepped_recipe, new_data = bikeTest) #Make sure recipe works on test
@@ -385,3 +387,88 @@ stacked_preds <- stack_mod %>%
   mutate(datetime=as.character(format(datetime)))
 
 vroom_write(x=stacked_preds, file="KaggleBikeShare/StackedPreds.csv", delim=",")
+
+
+# Boosted Trees -----------------------------------------------------------
+boost_mod <- boost_tree(tree_depth = tune(),
+                        mtry = tune(),
+                        trees = 1000,
+                        learn_rate = tune(),
+                        loss_reduction = tune(),
+                        sample_size = 1,
+                        stop_iter = tune(),
+                        min_n = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+## Workflow and model and recipe
+
+boosted_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(boost_mod)
+
+## set up grid of tuning values
+
+tuning_grid <- grid_regular(tree_depth(),
+                            mtry(range = c(1,(ncol(logTrainSet)))),
+                            learn_rate(),
+                            loss_reduction(),
+                            stop_iter(),
+                            min_n(),
+                            levels = 5)
+
+## set up k-fold CV
+
+folds <- vfold_cv(logTrainSet, v = 5, repeats=1)
+
+## Run the CV
+
+CV_results <- boosted_wf %>%
+  tune_grid(resamples=folds,
+            grid=tuning_grid,
+            metrics=metric_set(rmse, mae, rsq)) #Or leave metrics NULL
+
+## find best tuning parameters
+
+bestTune <- CV_results %>%
+  select_best("rmse")
+
+## Finalize workflow and prediction 
+
+final_wf <- tree_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data=logTrainSet)
+
+
+# BART --------------------------------------------------------------------
+
+# Set the model
+bart_mod <- parsnip::bart(mode = "regression",
+                 engine = "dbarts",
+                 trees = 25)
+
+# Use logged data
+logTrainSet <- bikeTrain %>%
+  mutate(count=log(count))
+
+# Set workflow
+bart_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(bart_mod) %>% 
+  fit(data = logTrainSet)
+
+# Predict and format
+bart_preds <- predict(bart_wf, new_data=bikeTest) %>%
+  mutate(.pred=exp(.pred)) %>% # RESETS THE LOG TRANSFORMATION
+  bind_cols(., bikeTest) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime)))
+
+# Write out
+vroom_write(x=bart_preds, file="KaggleBikeShare/BartPreds.csv", delim=",")
+
